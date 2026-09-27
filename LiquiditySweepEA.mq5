@@ -1,439 +1,460 @@
 #property copyright "Copilot"
-#property link      "https://github.com/Masdqqw/MT5_Liquidity_EA"
 #property version   "1.00"
 #property strict
 
 input group "General"
-input int    InpMagicNumber          = 123456;
-input bool   InpUseBuy               = true;
-input bool   InpUseSell              = true;
-input bool   InpUseRiskBasedLot      = true;
-input double InpRiskPercent          = 0.5;
-input double InpFixedLot             = 0.01;
-input int    InpMaxPositions         = 1;
-input int    InpSlippage             = 3;
-input int    InpTrailStartPoints     = 20;
-input int    InpTrailStepPoints      = 10;
+input int    InpMagicNumber       = 202406;
+input bool   InpUseBuy            = true;
+input bool   InpUseSell           = true;
+input bool   InpUseRiskLot        = true;
+input double InpRiskPercent       = 0.5;
+input double InpFixedLot          = 0.01;
+input int    InpMaxPositions      = 1;
+input int    InpSlippage          = 3;
 
-input group "Filters"
-input ENUM_TIMEFRAMES InpTrendTF     = PERIOD_H1;
-input int    InpTrendMaFast          = 20;
-input int    InpTrendMaSlow          = 200;
-input int    InpLookbackBars         = 200;
-input double InpLevelTolerancePoints = 25.0;
-input int    InpSwingPeriod          = 50;
-input bool   InpUseDailyLevels      = true;
-input bool   InpUseSessionLevels     = true;
-input bool   InpUseSwingLevels       = true;
-input bool   InpUseEqualLevels       = true;
+input group "Trend filter"
+input ENUM_TIMEFRAMES InpTrendTF = PERIOD_H1;
+input int    InpFastEMA           = 20;
+input int    InpSlowEMA           = 200;
+
+input group "Levels"
+input bool   InpUsePDH            = true;
+input bool   InpUsePDL            = true;
+input bool   InpUseAsiaLevels     = true;
+input bool   InpUseLondonLevels   = true;
+input bool   InpUseNYLevels       = true;
+input bool   InpUseSwingLevels    = true;
 
 input group "Risk / Reward"
-input int    InpStopLossPoints       = 30;
-input int    InpTakeProfitPoints     = 60;
-input double InpMinRiskReward        = 1.5;
-
-// ================================================================
-// Liquidity Sweep EA for MT5
-// ---------------------------------------------------------------
-// Trading concept:
-//  - identifies key liquidity levels from previous day, sessions,
-//    swings, and equal highs/lows;
-//  - waits for a sweep of that level and a continuation signal;
-//  - enters only in the direction of the higher timeframe trend.
-// ================================================================
+input int    InpStopLossPoints    = 30;
+input int    InpTakeProfitPoints  = 60;
+input int    InpTrailStartPoints  = 25;
+input int    InpTrailStepPoints   = 10;
 
 struct LevelInfo
 {
    double price;
-   bool   isUpper;     // true = resistance / upper liquidity
-   bool   active;      // still not swept
-   bool   swept;
-   datetime time;
+   bool   upper;
 };
 
-LevelInfo g_upperLevels[];
-LevelInfo g_lowerLevels[];
+LevelInfo gUpperLevels[];
+LevelInfo gLowerLevels[];
 
 int OnInit()
 {
+   ArrayResize(gUpperLevels, 0);
+   ArrayResize(gLowerLevels, 0);
    return(INIT_SUCCEEDED);
 }
 
 void OnDeinit(const int reason)
 {
-   ArrayResize(g_upperLevels, 0);
-   ArrayResize(g_lowerLevels, 0);
+   ArrayResize(gUpperLevels, 0);
+   ArrayResize(gLowerLevels, 0);
 }
 
 void OnTick()
 {
-   if(!IsTradingAllowed())
-      return;
-
-   RefreshLevels();
-
-   if(GetOpenOrdersTotal() >= InpMaxPositions)
-      return;
-
-   CheckAndManageTrades();
-
    if(!IsNewBar())
       return;
 
-   if(InpUseBuy && IsBuySetup())
-      OpenTrade(OP_BUY);
+   if(GetOpenPositions() >= InpMaxPositions)
+      return;
 
-   if(InpUseSell && IsSellSetup())
-      OpenTrade(OP_SELL);
-}
+   BuildLevels();
 
-bool IsTradingAllowed()
-{
-   datetime now = TimeCurrent();
-   int hour = TimeHour(now);
-   // 24/7 trading is allowed by default; allow simple hour filter if someone wants to use it
-   return true;
+   if(InpUseBuy && IsBuySignal())
+      OpenTrade(ORDER_TYPE_BUY);
+
+   if(InpUseSell && IsSellSignal())
+      OpenTrade(ORDER_TYPE_SELL);
+
+   ManageTrailingStops();
 }
 
 bool IsNewBar()
 {
-   static datetime lastBarTime = 0;
-   datetime currentBarTime = iTime(_Symbol, _Period, 0);
-   if(lastBarTime == currentBarTime)
+   static datetime lastTime = 0;
+   datetime currentTime = iTime(_Symbol, _Period, 0);
+
+   if(lastTime == currentTime)
       return false;
 
-   lastBarTime = currentBarTime;
+   lastTime = currentTime;
    return true;
 }
 
-void RefreshLevels()
+void BuildLevels()
 {
-   ArrayResize(g_upperLevels, 0);
-   ArrayResize(g_lowerLevels, 0);
+   ArrayResize(gUpperLevels, 0);
+   ArrayResize(gLowerLevels, 0);
 
-   if(InpUseDailyLevels)
+   if(InpUsePDH)
+      AddUpper(iHigh(_Symbol, PERIOD_D1, 1));
+   if(InpUsePDL)
+      AddLower(iLow(_Symbol, PERIOD_D1, 1));
+
+   if(InpUseAsiaLevels)
    {
-      AddLevel(iHigh(_Symbol, PERIOD_D1, 1), true, Time[1]);
-      AddLevel(iLow(_Symbol, PERIOD_D1, 1), false, Time[1]);
+      double high = GetSessionHigh(0, 6);
+      double low  = GetSessionLow(0, 6);
+      if(high > 0) AddUpper(high);
+      if(low > 0)  AddLower(low);
    }
 
-   if(InpUseSessionLevels)
+   if(InpUseLondonLevels)
    {
-      double asiaHigh = GetSessionHigh(0);
-      double asiaLow  = GetSessionLow(0);
-      if(asiaHigh > 0) AddLevel(asiaHigh, true, Time[0]);
-      if(asiaLow > 0)  AddLevel(asiaLow, false, Time[0]);
+      double high = GetSessionHigh(7, 10);
+      double low  = GetSessionLow(7, 10);
+      if(high > 0) AddUpper(high);
+      if(low > 0)  AddLower(low);
+   }
 
-      double londonHigh = GetSessionHigh(1);
-      double londonLow  = GetSessionLow(1);
-      if(londonHigh > 0) AddLevel(londonHigh, true, Time[0]);
-      if(londonLow > 0)  AddLevel(londonLow, false, Time[0]);
-
-      double nyHigh = GetSessionHigh(2);
-      double nyLow  = GetSessionLow(2);
-      if(nyHigh > 0) AddLevel(nyHigh, true, Time[0]);
-      if(nyLow > 0)  AddLevel(nyLow, false, Time[0]);
+   if(InpUseNYLevels)
+   {
+      double high = GetSessionHigh(13, 17);
+      double low  = GetSessionLow(13, 17);
+      if(high > 0) AddUpper(high);
+      if(low > 0)  AddLower(low);
    }
 
    if(InpUseSwingLevels)
    {
-      double swingHigh = iHigh(_Symbol, InpTrendTF, iHighest(_Symbol, InpTrendTF, MODE_HIGH, InpSwingPeriod, 0));
-      double swingLow  = iLow(_Symbol, InpTrendTF, iLowest(_Symbol, InpTrendTF, MODE_LOW, InpSwingPeriod, 0));
-      AddLevel(swingHigh, true, iTime(_Symbol, InpTrendTF, 0));
-      AddLevel(swingLow, false, iTime(_Symbol, InpTrendTF, 0));
-   }
+      int highestIndex = iHighest(_Symbol, InpTrendTF, MODE_HIGH, 50, 0);
+      int lowestIndex  = iLowest(_Symbol, InpTrendTF, MODE_LOW, 50, 0);
 
-   if(InpUseEqualLevels)
-   {
-      AddEqualLevels();
+      if(highestIndex >= 0)
+         AddUpper(iHigh(_Symbol, InpTrendTF, highestIndex));
+
+      if(lowestIndex >= 0)
+         AddLower(iLow(_Symbol, InpTrendTF, lowestIndex));
    }
 }
 
-void AddLevel(double price, bool isUpper, datetime time)
+void AddUpper(double price)
 {
    if(price <= 0)
       return;
 
-   LevelInfo info;
-   info.price = price;
-   info.isUpper = isUpper;
-   info.active = true;
-   info.swept = false;
-   info.time = time;
-
-   if(isUpper)
-      g_upperLevels[ArraySize(g_upperLevels)] = info;
-   else
-      g_lowerLevels[ArraySize(g_lowerLevels)] = info;
+   int n = ArraySize(gUpperLevels);
+   ArrayResize(gUpperLevels, n + 1);
+   gUpperLevels[n].price = price;
+   gUpperLevels[n].upper = true;
 }
 
-bool IsDuplicateLevel(double price, bool isUpper, double tolerance)
+void AddLower(double price)
 {
-   if(isUpper)
-   {
-      for(int i = 0; i < ArraySize(g_upperLevels); i++)
-      {
-         if(MathAbs(g_upperLevels[i].price - price) <= tolerance)
-            return true;
-      }
-   }
-   else
-   {
-      for(int i = 0; i < ArraySize(g_lowerLevels); i++)
-      {
-         if(MathAbs(g_lowerLevels[i].price - price) <= tolerance)
-            return true;
-      }
-   }
-   return false;
+   if(price <= 0)
+      return;
+
+   int n = ArraySize(gLowerLevels);
+   ArrayResize(gLowerLevels, n + 1);
+   gLowerLevels[n].price = price;
+   gLowerLevels[n].upper = false;
 }
 
-void AddEqualLevels()
+double GetSessionHigh(int startHour, int endHour)
 {
-   int bars = MathMin(InpLookbackBars, iBarShift(_Symbol, _Period, TimeCurrent()) + 50);
-   double tolerance = InpLevelTolerancePoints * _Point;
+   double res = 0.0;
+   int totalBars = 200;
 
-   for(int i = 1; i < bars - 2; i++)
+   for(int i = 0; i < totalBars; i++)
    {
-      double hi = iHigh(_Symbol, _Period, i);
-      double lo = iLow(_Symbol, _Period, i);
+      datetime t = iTime(_Symbol, PERIOD_H1, i);
+      int hour = TimeHour(t);
 
-      for(int j = i + 1; j < bars; j++)
-      {
-         double diffHigh = MathAbs(hi - iHigh(_Symbol, _Period, j));
-         double diffLow  = MathAbs(lo - iLow(_Symbol, _Period, j));
-
-         if(diffHigh <= tolerance && !IsDuplicateLevel(hi, true, tolerance))
-            AddLevel(hi, true, iTime(_Symbol, _Period, i));
-
-         if(diffLow <= tolerance && !IsDuplicateLevel(lo, false, tolerance))
-            AddLevel(lo, false, iTime(_Symbol, _Period, i));
-      }
-   }
-}
-
-double GetSessionHigh(int session)
-{
-   int startHour = 0;
-   int endHour = 0;
-
-   if(session == 0) { startHour = 0; endHour = 6; }
-   if(session == 1) { startHour = 7; endHour = 10; }
-   if(session == 2) { startHour = 13; endHour = 17; }
-
-   double result = 0;
-   for(int i = 0; i < 200; i++)
-   {
-      datetime barTime = iTime(_Symbol, PERIOD_H1, i);
-      int hour = TimeHour(barTime);
       if(hour >= startHour && hour <= endHour)
       {
          double val = iHigh(_Symbol, PERIOD_H1, i);
-         if(val > result)
-            result = val;
+         if(val > res)
+            res = val;
       }
    }
-   return result;
+
+   return res;
 }
 
-double GetSessionLow(int session)
+double GetSessionLow(int startHour, int endHour)
 {
-   int startHour = 0;
-   int endHour = 0;
+   double res = 0.0;
+   bool init = false;
+   int totalBars = 200;
 
-   if(session == 0) { startHour = 0; endHour = 6; }
-   if(session == 1) { startHour = 7; endHour = 10; }
-   if(session == 2) { startHour = 13; endHour = 17; }
-
-   double result = 0;
-   bool initialized = false;
-   for(int i = 0; i < 200; i++)
+   for(int i = 0; i < totalBars; i++)
    {
-      datetime barTime = iTime(_Symbol, PERIOD_H1, i);
-      int hour = TimeHour(barTime);
+      datetime t = iTime(_Symbol, PERIOD_H1, i);
+      int hour = TimeHour(t);
+
       if(hour >= startHour && hour <= endHour)
       {
          double val = iLow(_Symbol, PERIOD_H1, i);
-         if(!initialized || val < result)
+         if(!init || val < res)
          {
-            result = val;
-            initialized = true;
+            res = val;
+            init = true;
          }
       }
    }
-   return result;
+
+   return res;
 }
 
-void CheckAndManageTrades()
+bool IsBuySignal()
 {
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
-   {
-      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
-         continue;
+   double emaFast = iMA(_Symbol, InpTrendTF, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double emaSlow = iMA(_Symbol, InpTrendTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE, 0);
 
-      if(OrderMagicNumber() != InpMagicNumber)
-         continue;
-
-      if(OrderType() == OP_BUY)
-      {
-         double trailingStart = InpTrailStartPoints * _Point;
-         double trailStep = InpTrailStepPoints * _Point;
-         if(Bid - OrderOpenPrice() > trailingStart)
-         {
-            double newStop = Bid - trailingStart;
-            if(OrderStopLoss() < OrderOpenPrice() || OrderStopLoss() == 0)
-               newStop = OrderOpenPrice();
-            if(newStop > OrderStopLoss() + trailStep)
-               OrderModify(OrderTicket(), OrderOpenPrice(), newStop, OrderTakeProfit(), 0, clrNONE);
-         }
-      }
-      else if(OrderType() == OP_SELL)
-      {
-         double trailingStart = InpTrailStartPoints * _Point;
-         double trailStep = InpTrailStepPoints * _Point;
-         if(OrderOpenPrice() - Ask > trailingStart)
-         {
-            double newStop = Ask + trailingStart;
-            if(OrderStopLoss() > OrderOpenPrice() || OrderStopLoss() == 0)
-               newStop = OrderOpenPrice();
-            if(newStop < OrderStopLoss() - trailStep)
-               OrderModify(OrderTicket(), OrderOpenPrice(), newStop, OrderTakeProfit(), 0, clrNONE);
-         }
-      }
-   }
-}
-
-bool IsBuySetup()
-{
-   double emaFast = iMA(_Symbol, InpTrendTF, InpTrendMaFast, 0, MODE_EMA, PRICE_CLOSE, 0);
-   double emaSlow = iMA(_Symbol, InpTrendTF, InpTrendMaSlow, 0, MODE_EMA, PRICE_CLOSE, 0);
    if(emaFast < emaSlow)
       return false;
 
-   double buyLevel = FindBestLowerLevel();
-   if(buyLevel <= 0)
+   double level = GetNearestLowerLiquidity();
+   if(level <= 0)
       return false;
 
-   bool sweep = (Low[1] < buyLevel && Close[1] > buyLevel);
+   bool sweep = (Low[1] < level && Close[1] > level);
    if(!sweep)
       return false;
 
-   return (Bid > emaSlow);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(bid <= emaSlow)
+      return false;
+
+   return true;
 }
 
-bool IsSellSetup()
+bool IsSellSignal()
 {
-   double emaFast = iMA(_Symbol, InpTrendTF, InpTrendMaFast, 0, MODE_EMA, PRICE_CLOSE, 0);
-   double emaSlow = iMA(_Symbol, InpTrendTF, InpTrendMaSlow, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double emaFast = iMA(_Symbol, InpTrendTF, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double emaSlow = iMA(_Symbol, InpTrendTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE, 0);
+
    if(emaFast > emaSlow)
       return false;
 
-   double sellLevel = FindBestUpperLevel();
-   if(sellLevel <= 0)
+   double level = GetNearestUpperLiquidity();
+   if(level <= 0)
       return false;
 
-   bool sweep = (High[1] > sellLevel && Close[1] < sellLevel);
+   bool sweep = (High[1] > level && Close[1] < level);
    if(!sweep)
       return false;
 
-   return (Ask < emaSlow);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if(ask >= emaSlow)
+      return false;
+
+   return true;
 }
 
-double FindBestLowerLevel()
+double GetNearestLowerLiquidity()
 {
    double best = 0.0;
-   for(int i = 0; i < ArraySize(g_lowerLevels); i++)
+
+   for(int i = 0; i < ArraySize(gLowerLevels); i++)
    {
-      double level = g_lowerLevels[i].price;
-      if(level <= 0)
+      double price = gLowerLevels[i].price;
+      if(price <= 0)
          continue;
-      if(g_lowerLevels[i].swept)
-         continue;
-      if(best == 0 || level > best)
-         best = level;
+
+      if(best == 0 || price > best)
+         best = price;
    }
+
    return best;
 }
 
-double FindBestUpperLevel()
+double GetNearestUpperLiquidity()
 {
    double best = 0.0;
-   for(int i = 0; i < ArraySize(g_upperLevels); i++)
+
+   for(int i = 0; i < ArraySize(gUpperLevels); i++)
    {
-      double level = g_upperLevels[i].price;
-      if(level <= 0)
+      double price = gUpperLevels[i].price;
+      if(price <= 0)
          continue;
-      if(g_upperLevels[i].swept)
-         continue;
-      if(best == 0 || level < best)
-         best = level;
+
+      if(best == 0 || price < best)
+         best = price;
    }
+
    return best;
 }
 
-int GetOpenOrdersTotal()
+void OpenTrade(int type)
 {
-   int total = 0;
-   for(int i = 0; i < OrdersTotal(); i++)
-   {
-      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES) && OrderMagicNumber() == InpMagicNumber)
-         total++;
-   }
-   return total;
-}
-
-void OpenTrade(int orderType)
-{
-   double price = (orderType == OP_BUY) ? Ask : Bid;
-   double stopLoss = 0.0;
-   double takeProfit = 0.0;
-
-   if(orderType == OP_BUY)
-   {
-      double level = FindBestLowerLevel();
-      stopLoss = level - InpStopLossPoints * _Point;
-      takeProfit = price + InpTakeProfitPoints * _Point;
-      if(stopLoss <= 0)
-         stopLoss = price - InpStopLossPoints * _Point;
-      if(takeProfit <= 0)
-         takeProfit = price + InpTakeProfitPoints * _Point;
-   }
-   else
-   {
-      double level = FindBestUpperLevel();
-      stopLoss = level + InpStopLossPoints * _Point;
-      takeProfit = price - InpTakeProfitPoints * _Point;
-      if(stopLoss <= 0)
-         stopLoss = price + InpStopLossPoints * _Point;
-      if(takeProfit <= 0)
-         takeProfit = price - InpTakeProfitPoints * _Point;
-   }
-
-   double lot = GetLotSize();
+   double lot = GetLot();
    if(lot <= 0)
       return;
 
-   int ticket = OrderSend(_Symbol, orderType, lot, price, InpSlippage, stopLoss, takeProfit, "LiquiditySweepEA", InpMagicNumber, 0, clrNONE);
-   if(ticket < 0)
-      Print("OrderSend failed: ", GetLastError());
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double price = (type == ORDER_TYPE_BUY) ? ask : bid;
+
+   double sl = 0.0;
+   double tp = 0.0;
+
+   if(type == ORDER_TYPE_BUY)
+   {
+      double level = GetNearestLowerLiquidity();
+      sl = (level > 0) ? level - InpStopLossPoints * _Point : price - InpStopLossPoints * _Point;
+      tp = price + InpTakeProfitPoints * _Point;
+   }
+   else
+   {
+      double level = GetNearestUpperLiquidity();
+      sl = (level > 0) ? level + InpStopLossPoints * _Point : price + InpStopLossPoints * _Point;
+      tp = price - InpTakeProfitPoints * _Point;
+   }
+
+   sl = NormalizeDouble(sl, _Digits);
+   tp = NormalizeDouble(tp, _Digits);
+
+   MqlTradeRequest request;
+   MqlTradeResult result;
+
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = _Symbol;
+   request.volume = lot;
+   request.type = type;
+   request.price = price;
+   request.sl = sl;
+   request.tp = tp;
+   request.magic = InpMagicNumber;
+   request.comment = "LiquiditySweepEA";
+   request.deviation = InpSlippage;
+
+   if(OrderSend(request, result))
+   {
+      // успішно
+   }
 }
 
-double GetLotSize()
+double GetLot()
 {
-   if(InpUseRiskBasedLot)
+   if(InpUseRiskLot)
    {
       double balance = AccountInfoDouble(ACCOUNT_BALANCE);
       double riskMoney = balance * InpRiskPercent / 100.0;
       double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
       double lot = riskMoney / (InpStopLossPoints * tickValue * 10.0);
+
       if(lot <= 0)
          lot = InpFixedLot;
+
       return MathMax(lot, 0.01);
    }
 
    return InpFixedLot;
 }
 
-// ================================================================
-// End of EA
-// ================================================================
+void ManageTrailingStops()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+
+      if(posType == POSITION_TYPE_BUY)
+      {
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double distance = bid - openPrice;
+
+         if(distance > InpTrailStartPoints * _Point)
+         {
+            double newSL = bid - InpTrailStartPoints * _Point;
+
+            if(currentSL == 0.0 || newSL > currentSL + InpTrailStepPoints * _Point)
+            {
+               MqlTradeRequest request;
+               MqlTradeResult result;
+
+               ZeroMemory(request);
+               ZeroMemory(result);
+
+               request.action = TRADE_ACTION_SLTP;
+               request.position = ticket;
+               request.sl = newSL;
+               request.tp = currentTP;
+
+               if(OrderSend(request, result))
+               {
+                  // успішно
+               }
+            }
+         }
+      }
+      else if(posType == POSITION_TYPE_SELL)
+      {
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double distance = openPrice - ask;
+
+         if(distance > InpTrailStartPoints * _Point)
+         {
+            double newSL = ask + InpTrailStartPoints * _Point;
+
+            if(currentSL == 0.0 || newSL < currentSL - InpTrailStepPoints * _Point)
+            {
+               MqlTradeRequest request;
+               MqlTradeResult result;
+
+               ZeroMemory(request);
+               ZeroMemory(result);
+
+               request.action = TRADE_ACTION_SLTP;
+               request.position = ticket;
+               request.sl = newSL;
+               request.tp = currentTP;
+
+               if(OrderSend(request, result))
+               {
+                  // успішно
+               }
+            }
+         }
+      }
+   }
+}
+
+int GetOpenPositions()
+{
+   int total = 0;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      total++;
+   }
+
+   return total;
+}
